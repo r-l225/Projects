@@ -5,16 +5,16 @@ DFRobot_BMI160 bmi160;
 const int8_t i2c_addr = 0x69;
 float angle = 0;  // Store accumulated yaw angle
 
-// IR Sensor Pins (ESP32 Feather V2)
+// IR Sensor Pins 
 int IRSensor1 = 36;
 int IRSensor2 = 39;
 int IRSensor3 = 34;
 int IRSensor4 = 35;
 
-const int trigPin = 26; //PIN A5 on Adafruit ESP32 Feather V2
-const int echoPin = 25; //PIN A4 on Adafruit ESP32 Feather V2
+const int trigPin = 26; 
+const int echoPin = 25; 
 
-//Motor Contorl Pins for ESP32-WROOM-32
+//Motor Contorl Pins
 const int L_PWM = 0; // PWM control for left motor
 const int L_IN1 = 15; // Direction control for left motor
 const int L_IN2 = 2; // Direction control for left motor
@@ -154,45 +154,49 @@ void readGyroData() {
 void handleBoundaryMovement() {
   switch (boundaryCode) {
     case 0x7:
-      rotateMotors();
-      Serial.println("Rotating 7.");
+      stopMotors();
+      curveLeft();
+      Serial.println("7.");
       break;
     case 0xB:
-      rotateMotors();
-      Serial.println("Rotating 8.");
-      break;
-    case 0x3:
-      reverseMotors();
-      Serial.println("Reversing 3.");
-      break;
-    case 0xC:
-      forwardMotors();
-      Serial.println("Forward C.");
-      break;
-    case 0x5:
-      rotateMotors();
-      Serial.println("Rotating 5.");
-      break;
-    case 0xA:
-      rotateMotors();
-      Serial.println("Rotating A.");
+      stopMotors();
+      curveRight();
+      Serial.println("B");
       break;
     case 0xD:
-      rotateMotors();
-      Serial.println("Rotating D.");
+      stopMotors();
+      curveLeft();
+      Serial.println("D");
+      break;
+    case 0xE:
+      stopMotors();
+      curveRight();
+      Serial.println("LEFT REAR");
+      break;
+    case 0x3:
+      stopMotors();
+      reversePivot();
+      Serial.println("3");
+      break;
+    case 0xC:
+      moveForward();
+      Serial.println("C");
+      break;
+    case 0x5:
+      stopMotors();
+      sharpLeft();
+      Serial.println("5");
+      break;
+    case 0xA:
+      stopMotors();
+      sharpRight();
+      Serial.println("A");
       break;
     default:
-      rotateMotors();
+      stopMotors();
       Serial.println("Rotating DEFAULT.");
       break;
   }
-}
-
-void IR_Sensor_setup() {
-  pinMode(IRSensor1, INPUT);
-  pinMode(IRSensor2, INPUT);
-  pinMode(IRSensor3, INPUT);
-  pinMode(IRSensor4, INPUT);
 }
 
 uint8_t IR_Sensor_read() {
@@ -200,7 +204,18 @@ uint8_t IR_Sensor_read() {
   int status2 = digitalRead(IRSensor2);
   int status3 = digitalRead(IRSensor3);
   int status4 = digitalRead(IRSensor4);
-  return (status4 << 3) | (status3 << 2) | (status2 << 1) | status1;
+
+  uint8_t boundaryCode = (status4 << 3) | (status3 << 2) | (status2 << 1) | status1;
+  
+  Serial.print("Sensor States: ");
+  Serial.print("Front-Left: "); Serial.print(status1);
+  Serial.print(" | Front-Right: "); Serial.print(status2);
+  Serial.print(" | Back-Left: "); Serial.print(status3);
+  Serial.print(" | Back-Right: "); Serial.println(status4);
+  Serial.print("Boundary Code: ");
+  Serial.println(boundaryCode, BIN);
+
+  return boundaryCode;
 }
 
 
