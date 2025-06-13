@@ -1,0 +1,700 @@
+//newPULL
+
+#include <Arduino.h>
+#include <DFRobot_BMI160.h>
+
+// ================= FreeRTOS Handles =================
+TaskHandle_t TaskSensorsHandle;
+TaskHandle_t TaskNavigationHandle;
+
+// ================= Pins =================
+const int FrontLeftSensor  = 36;
+const int FrontRightSensor = 39;
+const int BackLeftSensor = 34;
+const int BackRightSensor = 35;
+
+// Motor pins
+const int L_IN1 = 4;
+const int L_IN2 = 13;
+const int R_IN1 = 2;
+const int R_IN2 = 0;
+
+const int PWMR = 27;
+const int PWML = 14;
+
+const int STBY = 12;
+
+// Button & LEDs
+const int BUTTON_PIN  = 15;
+const int R_LED = 23;
+const int G_LED = 32;
+const int B_LED = 33;
+
+const int maxSpeed = 255;      // Maximum PWM duty cycle
+const int minSpeed = 160;
+
+
+
+// ================= PWM =================
+const int PWMFreq       = 1000;   
+const int PWMResolution = 8;     
+const int MAX_SPEED     = 255;    
+
+// ================= BMI160 =================
+DFRobot_BMI160 bmi160;
+const int8_t i2c_addr = 0x69;
+
+SemaphoreHandle_t stateMutex;  // protects shared data
+
+// ================= State Machine =================
+enum class RobotState {
+  WAITING,       
+  MOVING_FORWARD,
+  STOPPED,
+  RECORRECT        
+};
+volatile RobotState currentState = RobotState::WAITING;
+
+// ================= Gyro Calibration =================
+float deltaAngle = 0.0f;
+float x_comp = 0.0f;
+float y_comp = 0.0f;
+static float gyroOffset = 0.0f;
+
+  float integral = 0;
+  float derivative = 0;
+  float previousError = 0;
+  float output = 0;
+
+
+int readingIndex = 0; // Index for the circular buffer
+float totalAccel = 0; // Sum of readings
+float avgAccel = 0; // Average of forward accelerations
+
+const float movementThreshold = 1.00f;
+volatile bool boundaryDetected = false;
+volatile bool movementDetected = true;
+
+unsigned long prevTime = 0;
+unsigned long currentTime = 0;
+float deltaTime = 0;
+float velocity = 0;
+float deltaV = 0;
+
+uint8_t boundary;
+
+// Forward declarations
+void TaskSensors(void *pvParameters);
+void TaskNavigation(void *pvParameters);
+void changeState(RobotState newState);
+
+void calibrateGyro(int samples = 100);
+float readAccel();
+float readGyro(float angle);
+uint8_t readIR();
+void StopMotors();
+void Forward();
+void countdownStart();
+void RotateToBigAngle(float setpoint);
+void RotateToSmallAngle(float setpoint);
+void recorrect(uint8_t bounds);
+
+
+
+
+// ============ setup() ============
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  pinMode(R_LED, OUTPUT);
+  pinMode(G_LED, OUTPUT);
+  pinMode(B_LED, OUTPUT);
+  digitalWrite(R_LED, LOW);
+  digitalWrite(G_LED, LOW);
+  digitalWrite(B_LED, LOW);
+
+  pinMode(BUTTON_PIN,INPUT_PULLUP);
+
+  // IR sensor pins
+  pinMode(FrontLeftSensor, INPUT);
+  pinMode(FrontRightSensor, INPUT);
+  pinMode(BackLeftSensor, INPUT);
+  pinMode(BackRightSensor, INPUT);
+
+  // Motor pin setup
+  pinMode(R_IN1,  OUTPUT);
+  pinMode(R_IN2,  OUTPUT);
+  pinMode(L_IN1,  OUTPUT);
+  pinMode(L_IN2,  OUTPUT);
+
+  pinMode(PWMR, OUTPUT);
+  pinMode(PWML, OUTPUT);
+
+  pinMode(STBY, OUTPUT);
+  digitalWrite(STBY, HIGH);
+
+  // ============ Initialize the BMI160 ============
+  if (bmi160.softReset() != BMI160_OK) {
+    Serial.println("BMI160 reset failed");
+    while (1);
+  }
+  if (bmi160.I2cInit(i2c_addr) != BMI160_OK) {
+    Serial.println("BMI160 I2C init failed");
+    while (1);
+  }
+
+  // ============ Create Mutex ============
+  stateMutex = xSemaphoreCreateMutex();
+
+  // ============ Create Tasks ============
+  xTaskCreatePinnedToCore(
+    TaskSensors,        
+    "TaskSensors",      
+    10000,              
+    NULL,               
+    2,                  // Higher priority
+    &TaskSensorsHandle, 
+    1                   
+  );
+
+  xTaskCreatePinnedToCore(
+    TaskNavigation,     
+    "TaskNavigation",   
+    10000,              
+    NULL,               
+    1,                  // Lower priority
+    &TaskNavigationHandle,
+    0                   
+  );
+}
+
+void loop() {
+   if (currentState == RobotState::WAITING) {
+    int btn =digitalRead(BUTTON_PIN);
+    if (btn == LOW) {  // Button pressed
+      Serial.println("Button pressed");
+      countdownStart();  // Start the countdown
+      currentState =  RobotState::MOVING_FORWARD;  
+    } else {
+      digitalWrite(R_LED, HIGH);
+      digitalWrite(G_LED, LOW);
+      digitalWrite(B_LED, LOW);
+      delay(200);
+      digitalWrite(R_LED, LOW);
+      delay(200);
+    }
+  }
+}
+
+void countdownStart() {
+  for (int i = 5; i > 0; i--) {
+    // LED colors: Red -> Blue -> Green
+    if (i % 3 == 0) {
+      digitalWrite(R_LED, HIGH);  
+      digitalWrite(B_LED, LOW);
+      digitalWrite(G_LED, LOW);
+      Serial.println("Countdown: Red LED is ON");
+    } else if (i % 3 == 1) {
+      digitalWrite(R_LED, LOW);
+      digitalWrite(B_LED, HIGH);  
+      digitalWrite(G_LED, LOW);
+      Serial.println("Countdown: Blue LED is ON");
+    } else {
+      digitalWrite(R_LED, HIGH);
+      digitalWrite(B_LED, HIGH);
+      digitalWrite(G_LED, LOW); 
+      Serial.println("Countdown: Green LED is ON");
+    }
+
+    Serial.print("Countdown: ");
+    Serial.println(i); 
+    delay(1000);       
+  }
+
+ 
+  digitalWrite(R_LED, LOW);
+  digitalWrite(G_LED, LOW);
+  digitalWrite(B_LED, LOW);
+
+  Serial.println("Countdown complete");
+}
+
+void changeState(RobotState newState) {
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  currentState = newState;
+  xSemaphoreGive(stateMutex);
+}
+// ============ TaskSensors() ============
+void TaskSensors(void *pvParameters) {
+    // Print once to indicate which core is running this task
+    Serial.print("TaskSensors running on core ");
+    Serial.println(xPortGetCoreID());
+
+    for (;;) {
+        // Skip sensor processing while in WAITING state
+        if (currentState == RobotState::WAITING) {
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+            continue;
+        }
+        // 1) Read sensor data 
+        //xSemaphoreTake(stateMutex, portMAX_DELAY);
+        //deltaAngle = readGyro(deltaAngle);
+        Serial.print("Angle 1 : ");
+        Serial.println(deltaAngle);
+        //xSemaphoreGive(stateMutex);
+        deltaAngle = readGyro(deltaAngle);
+        boundary = readIR();
+        prevTime = currentTime;
+        float forwardAccel = readAccel(); 
+        currentTime = millis();
+        deltaTime = (currentTime - prevTime)/1000.0f;
+        deltaV = forwardAccel * deltaTime;
+        if (deltaV >= 0.21f && deltaV <= 0.31f){
+          velocity += 0.20;
+       }
+       else if (deltaV >= 0.31f){
+        velocity += deltaV;
+       }
+       else{
+         velocity = 0;
+       }
+
+         
+        if (boundary == 3 | boundary == 12 | boundary == 9 | boundary == 6 ){ // Endline Detected
+          changeState(RobotState::STOPPED);
+          delay(200);
+          deltaAngle = 0;
+          changeState(RobotState::WAITING);
+        } 
+        else if (boundary == 5){ //Right Boundary Detected
+          changeState(RobotState::RECORRECT);
+        }
+        else if (boundary == 10){ //Left Boundary DEtected
+          changeState(RobotState::RECORRECT);
+        }
+
+        static unsigned long noMovementStart = 0; // Tracks the start of the no-movement period
+
+        // Debugging: Print the current acceleration
+        Serial.print("Forward Velocity: ");
+        Serial.println(velocity);
+
+        Serial.print("Delta Velocity: ");
+        Serial.println(deltaV);
+// Check if forward acceleration is below the movement threshold
+if (fabs(velocity) < movementThreshold) {
+    if (noMovementStart == 0) {
+        noMovementStart = millis(); // Start the no-movement timer
+    }
+    // Check if the no-movement period exceeds 3 seconds
+    if (millis() - noMovementStart > 2800) { // 3-second delay
+        Serial.println("No significant movement detected for 3 seconds. Stopping robot.");
+        changeState(RobotState::STOPPED); // Change the robot's state to STOPPED
+        noMovementStart = 0; // Reset the timer after stopping
+    }
+} else {
+    noMovementStart = 0; // Reset the timer immediately if movement is detected
+    Serial.println("Movement detected. Timer reset.");
+}
+        // Delay to allow task scheduling
+        vTaskDelay(20 / portTICK_PERIOD_MS);
+    }
+}
+
+
+// ============ TaskNavigation() ============
+void TaskNavigation(void *pvParameters) {
+  Serial.print("TaskNavigation running on core ");
+  Serial.println(xPortGetCoreID());
+
+  for (;;) {
+    RobotState localState;
+
+    // Copy shared data
+    xSemaphoreTake(stateMutex, portMAX_DELAY);
+    localState   = currentState;
+    xSemaphoreGive(stateMutex);
+
+    switch (localState) {
+      case RobotState::WAITING:
+        StopMotors();
+        break;
+
+      case RobotState::MOVING_FORWARD:
+        digitalWrite(R_LED, LOW);
+        digitalWrite(B_LED, HIGH);
+        digitalWrite(G_LED, LOW);
+
+        // Correct heading in real-time
+        //deltaAngle = readGyro(deltaAngle);
+        Forward();
+        
+        digitalWrite(R_LED, HIGH);
+        digitalWrite(G_LED, LOW);
+        digitalWrite(B_LED, LOW);
+
+        break;
+
+      case RobotState::STOPPED:
+        StopMotors();
+        digitalWrite(B_LED, HIGH); // Indicate STOPPED
+        digitalWrite(G_LED, LOW);
+        digitalWrite(R_LED, LOW);
+        break;
+
+      case RobotState::RECORRECT:
+        digitalWrite(B_LED, LOW); // Indicate STOPPED
+        digitalWrite(G_LED, LOW);
+        digitalWrite(R_LED, LOW);
+        StopMotors();
+        digitalWrite(B_LED, HIGH); // Indicate STOPPED
+        digitalWrite(G_LED, LOW);
+        digitalWrite(R_LED, HIGH);
+        recorrect(boundary);
+        break;
+    }
+
+    vTaskDelay(20 / portTICK_PERIOD_MS);
+  }
+}
+
+// Read the Gyroscope
+float readGyro(float angle){
+  int rslt;
+  int trash;
+  float Yaw = 0;
+  ////only read gyro data from bmi160
+  int16_t accelGyro[6]={0}; 
+  //get both accel and gyro data from bmi160
+  //parameter accelGyro is the pointer to store the data
+  rslt = bmi160.getAccelGyroData(accelGyro);
+
+  if(rslt == 0){
+    for(int i=0;i<6;i++){
+      if (i==2){
+        //the first three are gyro data
+        Yaw = (((accelGyro[i]+11.85)/128)*0.6);
+        if(Yaw > 0.15){
+          angle += Yaw;
+        }
+        else if(Yaw <= 0.15 and Yaw >=-0.15){
+          angle += 0;
+        }
+        else{
+          angle -= abs(Yaw);
+        }
+      }
+      else{
+        // the first two (pitch and roll) are irrelevant for our angle.
+        //the following three data are accel data
+        trash = accelGyro[i];
+      }
+    }
+    //Serial.println();
+  }else{
+    Serial.println("err");
+  }
+  delay(50);
+  return angle;
+}
+
+
+float readAccel() {
+    int16_t accelGyro[6] = {0};
+    float side2side = 0;
+    float fwdbkwd = 0;
+    float horizontal = 0;
+    float x_comp = 0;
+    float y_comp = 0;
+
+    // Read accel and gyro data
+    int rslt = bmi160.getAccelGyroData(accelGyro);
+    if (rslt == 0) {
+        for (int i = 3; i < 6; i++) { // Process only accel data
+            if (i == 4) {
+                side2side = (accelGyro[i] / 16384.0) - 0.02;
+                x_comp += (fabs(side2side) > 0.03) ? side2side : 0;
+                //Serial.print("Side-to-Side Accel: "); Serial.println(side2side, 4);
+            } else {
+                fwdbkwd = (accelGyro[i] / 16384.0) + 0.05;
+                y_comp = (fabs(fwdbkwd) > 0.03) + 1 ? fwdbkwd : 0;
+                //Serial.print("Forward Accel: "); Serial.println(fwdbkwd, 4);
+            }
+        }
+    } else {
+        Serial.println("Error reading accelerometer data.");
+    }
+   // horizontal = sqrt((y_comp * y_comp) - (x_comp * x_comp));
+    horizontal = -9.81*(x_comp);
+    delay(50); // Optional delay for stabilization
+    return horizontal; // Return forward-backward component
+}
+
+void FWD(){
+      digitalWrite(L_IN1, HIGH);     // L Forward == maxPWM
+      digitalWrite(L_IN2, LOW);          // L Backward == 0
+      digitalWrite(R_IN1, HIGH); // R Forward == maxPWM - error Correction
+      digitalWrite(R_IN2, LOW); 
+      analogWrite(PWML, 200);  
+      analogWrite(PWMR, 200);
+}
+
+void BKWD(){
+      digitalWrite(L_IN2, HIGH);     // L Forward == maxPWM
+      digitalWrite(L_IN1, LOW);          // L Backward == 0
+      digitalWrite(R_IN2, HIGH); // R Forward == maxPWM - error Correction
+      digitalWrite(R_IN1, LOW); 
+      analogWrite(PWML, 200);  
+      analogWrite(PWMR, 200);
+}
+
+void Forward() {
+  float maxPWMR = maxSpeed;
+  float maxPWML = maxSpeed;
+  float setpoint = 0.0f;
+  float angle = deltaAngle;
+
+  float error = setpoint;
+  float PWM_L = 0.0f;
+  float PWM_R = 0.0f;
+  float Kp = 15.0;
+  float Ki = 0.10;
+  float Kd = 3.5;
+
+    error = setpoint + angle;
+    integral += error;
+    //rintegral = constrain(integral, -1000, 1000 );
+    derivative = error - previousError;
+    output = Kp * error + Ki * integral + Kd * derivative;
+/*    if (-0.5 <= error <= 0.5){
+      digitalWrite(L_IN1, HIGH);     // L Forward == maxPWM
+      digitalWrite(L_IN2, LOW);          // L Backward == 0
+      analogWrite(PWML, maxSpeed);
+
+      digitalWrite(R_IN1, HIGH); // R Forward == maxPWM - error Correction
+      digitalWrite(R_IN2, LOW);          // R Backward == 0
+      analogWrite(PWMR, maxSpeed);
+    }*/
+    if (error >= 0){
+      PWM_R = constrain(maxPWMR - abs(output), minSpeed, maxSpeed);
+      PWM_L = constrain(maxPWML, minSpeed, maxSpeed);
+
+      digitalWrite(L_IN1, HIGH);     // L Forward == maxPWM
+      digitalWrite(L_IN2, LOW);          // L Backward == 0
+      analogWrite(PWML, int(PWM_L));
+
+      digitalWrite(R_IN1, HIGH); // R Forward == maxPWM - error Correction
+      digitalWrite(R_IN2, LOW);          // R Backward == 0
+      analogWrite(PWMR, int(PWM_R));
+
+    }
+    else{
+      PWM_R = constrain(maxPWMR, minSpeed, maxSpeed);
+      PWM_L = constrain(maxPWML - abs(output), minSpeed, maxSpeed);
+
+      digitalWrite(L_IN1, HIGH); // L Forward == maxPWM - error Correction
+      digitalWrite(L_IN2, LOW);          // L Backward == 0
+      analogWrite(PWML, int(PWM_L));
+
+      digitalWrite(R_IN1, HIGH);     // R Forward == maxPWM
+      digitalWrite(R_IN2, LOW);          // R Backward
+      analogWrite(PWMR, int(PWM_R));
+    }
+    previousError = error;
+  
+}
+
+// ============ StopMotors() ============
+void StopMotors() {
+  // Turn off all pins
+      analogWrite(PWMR, 0);  
+      analogWrite(PWML, 0);
+      digitalWrite(L_IN1, LOW);    
+      digitalWrite(L_IN2, LOW);          
+      digitalWrite(R_IN1, LOW); 
+      digitalWrite(R_IN2, LOW);    
+
+}
+
+// ============ readIR() ============
+uint8_t readIR() {
+  int statusFL = digitalRead(FrontLeftSensor);
+  int statusFR = digitalRead(FrontRightSensor);
+  int statusBL = digitalRead(BackLeftSensor);
+  int statusBR = digitalRead(BackRightSensor);
+  // If both sensors triggered => 3, etc.
+  Serial.println((statusBL << 3) | (statusBR << 2) |(statusFL << 1) | statusFR);
+
+  return (statusBL << 3) | (statusBR << 2) |(statusFL << 1) | statusFR; 
+}
+
+void recorrect(uint8_t bounds){
+  StopMotors();
+  if (bounds == 5){ // boundary on right
+    BKWD();
+    delay(500);
+    StopMotors();
+    RotateToSmallAngle(15); //
+    //FWD();
+    delay(250);
+    StopMotors();
+    delay(250);
+    //RotateToSmallAngle(-30);
+    deltaAngle = 0;
+  }
+  else if(bounds == 10){// boundary on left
+    BKWD();
+    delay(500);
+    StopMotors();
+    RotateToSmallAngle(-15); //
+    //FWD();
+    delay(250);
+    StopMotors();
+    delay(250);
+    //RotateToSmallAngle(30);
+    deltaAngle = 0;
+  }
+  deltaAngle = 0;
+  StopMotors();
+  changeState(RobotState::MOVING_FORWARD);
+}
+
+void RotateToSmallAngle(float setpoint){
+  float angle = 0;
+  float error = setpoint;
+  float PWM_L = 0;
+  float PWM_R = 0;
+
+  float integral = 0;
+  float derivative = 0;
+  float previousError = 0;
+  float output = 0;
+
+  float Kp = 2.5*abs(setpoint)/45;
+  float Ki = 0.2*abs(setpoint)/45;
+  float Kd = 0.15*abs(setpoint)/45;
+
+
+        previousError = abs(error);
+        error = setpoint - angle;
+        integral += abs(error);
+        derivative = error - previousError;
+        output = Kp * abs(error) - Ki * integral + Kd * abs(derivative);
+        output = constrain(output, -maxSpeed, maxSpeed);
+  if (error < 0){
+    while (error <= -2){
+      PWM_R = constrain(minSpeed + output, minSpeed, 200);
+      PWM_L = constrain(minSpeed + output, minSpeed, 200);
+
+      digitalWrite(L_IN1, HIGH);     // L Forward == maxPWM
+      digitalWrite(L_IN2, LOW);          // L Backward == 0
+      analogWrite(PWML, int(PWM_L));
+
+      digitalWrite(R_IN1, LOW); // R Forward == maxPWM - error Correction
+      digitalWrite(R_IN2, HIGH);          // R Backward == 0
+      analogWrite(PWMR, int(PWM_R));
+
+        angle = readGyro(angle);
+        previousError = error;
+        error = setpoint - angle;
+        integral += abs(error);
+        derivative = error - previousError;
+        output = Kp * abs(error) - Ki * integral + Kd * abs(derivative);
+        output = constrain(output, -maxSpeed, maxSpeed);
+      //// Motor Controls
+    }
+    StopMotors();
+  }
+  else{
+    while (error >= 2){
+      PWM_R = constrain(minSpeed + output, minSpeed, 200);
+      PWM_L = constrain(minSpeed + output, minSpeed, 200);
+            
+      digitalWrite(L_IN1, LOW);     // L Forward == maxPWM
+      digitalWrite(L_IN2, HIGH);          // L Backward == 0
+      analogWrite(PWML, int(PWM_L));
+
+      digitalWrite(R_IN1, HIGH); // R Forward == maxPWM - error Correction
+      digitalWrite(R_IN2, LOW);          // R Backward == 0
+      analogWrite(PWMR, int(PWM_R));
+        angle = readGyro(angle);
+        previousError = error;
+        error = setpoint - angle;
+        integral += abs(error);
+        derivative = error - previousError;
+        output = Kp * abs(error) - Ki * integral + Kd * abs(derivative);
+        output = constrain(output, -maxSpeed, maxSpeed);
+    }
+    StopMotors();
+  }
+}
+
+// Rotate to any desired angle greater than 120 degrees
+void RotateToBigAngle(float setpoint){
+  float angle = 0;
+  float error = setpoint;
+  float PWM_L = 0;
+  float PWM_R = 0;
+
+  float integral = 0;
+  float derivative = 0;
+  float previousError = 0;
+  float output = 0;
+  float Kp = 8*abs(setpoint)/90;
+  float Ki = 0.5*abs(setpoint)/90;
+  float Kd = 0.3*abs(setpoint)/90;
+ 
+        previousError = abs(error);
+        error = setpoint - angle;
+        integral += abs(error);
+        derivative = error - previousError;
+        output = Kp * abs(error) - Ki * integral + Kd * abs(derivative);
+        output = constrain(output, -maxSpeed, maxSpeed);
+  if (error < 0){
+    while (error <= -2){
+      PWM_R = constrain(minSpeed + output, minSpeed+50, maxSpeed);
+      PWM_L = constrain(minSpeed + output, minSpeed+50, maxSpeed);
+
+      digitalWrite(L_IN1, HIGH);     // L Forward == maxPWM
+      digitalWrite(L_IN2, LOW);          // L Backward == 0
+      analogWrite(PWML, int(PWM_L));
+
+      digitalWrite(R_IN1, LOW); // R Forward == maxPWM - error Correction
+      digitalWrite(R_IN2, HIGH);          // R Backward == 0
+      analogWrite(PWMR, int(PWM_R));
+
+        angle = readGyro(angle);
+        previousError = error;
+        error = setpoint - angle;
+        integral += abs(error);
+        derivative = error - previousError;
+        output = Kp * abs(error) - Ki * integral + Kd * abs(derivative);
+        output = constrain(output, -maxSpeed, maxSpeed);
+      //// Motor Controls
+    }
+    StopMotors();
+  }
+  else{
+    while (error >= 2){
+      PWM_R = constrain(minSpeed + output, minSpeed+50, maxSpeed);
+      PWM_L = constrain(minSpeed + output, minSpeed+50, maxSpeed);
+            
+      digitalWrite(L_IN1, LOW);     // L Forward == maxPWM
+      digitalWrite(L_IN2, HIGH);          // L Backward == 0
+      analogWrite(PWML, int(PWM_L));
+
+      digitalWrite(R_IN1, HIGH); // R Forward == maxPWM - error Correction
+      digitalWrite(R_IN2, LOW);          // R Backward == 0
+      analogWrite(PWMR, int(PWM_R));
+        angle = readGyro(angle);
+        previousError = error;
+        error = setpoint - angle;
+        integral += abs(error);
+        derivative = error - previousError;
+        output = Kp * abs(error) - Ki * integral + Kd * abs(derivative);
+        output = constrain(output, -maxSpeed, maxSpeed);
+    }
+    StopMotors();
+  }
+}
